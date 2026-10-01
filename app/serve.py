@@ -18,7 +18,8 @@ def main() -> int:
     args = ap.parse_args()
 
     store = FrozenStore(os.path.join(args.data, "audits.json"))
-    httpd = build_server(args.host, args.port, store)
+    correction_store = FrozenStore(os.path.join(args.data, "corrections.json"))
+    httpd = build_server(args.host, args.port, store, correction_store)
     print(f"slot-audit listening on {args.host}:{args.port} (data={args.data})",
           flush=True)
     try:

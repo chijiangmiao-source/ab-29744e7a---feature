@@ -121,6 +121,76 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
   </section>
 </div>
+
+<section class="card" style="margin-top:20px;">
+  <h2>提交重放纠正（不改动任何扇区字节，仅重排写入顺序）</h2>
+  <div class="hint" style="margin:0 0 10px;">
+    适用于已冻结来源审计：镜像内每个扇区均通过既有字节级校验，但物理写入顺序使
+    <b>目标事务</b>未被采纳。服务在全部扇区排列中按既有恢复语义逐前缀裁决，给出
+    <b>相邻换位次数最少</b>、再按最终原始下标序列稳定裁决的可重放编排；任何前缀都
+    不会把未完成的目标页当作可启动。至多 12 个扇区。
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px 14px;">
+    <div>
+      <label for="corr-id">稳定纠正标识</label>
+      <input id="corr-id" type="text" placeholder="例如 REPLAY-20261001-01" value="REPLAY-0001">
+    </div>
+    <div>
+      <label for="corr-src">冻结来源审计标识</label>
+      <input id="corr-src" type="text" placeholder="例如 OBC-AUDIT-0001">
+    </div>
+    <div>
+      <label for="corr-active">初始活动槽</label>
+      <input id="corr-active" type="text" value="SLOT_A">
+    </div>
+    <div>
+      <label for="corr-tx">目标事务标识（整数）</label>
+      <input id="corr-tx" type="text" inputmode="numeric" placeholder="例如 200">
+    </div>
+  </div>
+  <label for="corr-sectors">来源镜像扇区（每行一个 88 字符 Base64，至多 12 个；顺序与冻结来源一致）</label>
+  <textarea id="corr-sectors" style="min-height:120px;" placeholder="U0NUU..."></textarea>
+  <div style="margin-top:12px;">
+    <button id="corr-submit">提交重放纠正</button>
+    <button id="corr-load" class="ghost">按纠正标识重开冻结结果</button>
+    <button id="corr-copy" class="ghost">复用上方来源镜像</button>
+  </div>
+  <div id="corr-err" class="err-inline"></div>
+
+  <div id="corr-empty" class="muted" style="margin-top:12px;">尚未计算纠正编排。</div>
+  <div id="corr-result" style="display:none;margin-top:14px;">
+    <div class="big good" id="corr-headline"></div>
+    <div class="sub" id="corr-sub"></div>
+    <div class="sub" id="corr-orig" style="margin-top:6px;"></div>
+
+    <div class="boot" style="margin-top:12px;">
+      <div><b>规范物理下标序列</b>（最终顺序，数字为来源镜像中的冻结物理下标）：</div>
+      <div id="corr-seq" style="font-size:18px;letter-spacing:2px;margin:6px 0;"></div>
+      <div class="sub">相邻换位次数：<b id="corr-swaps"></b> ·
+        来源扇区数 <span id="corr-n"></span> · 来源 SHA-256
+        <code id="corr-hash"></code></div>
+      <details style="margin-top:6px;">
+        <summary class="muted" style="cursor:pointer;">具体相邻换位步骤（位置对，0 起，按执行顺序）</summary>
+        <code id="corr-steps" style="word-break:break-all;"></code>
+      </details>
+    </div>
+
+    <div class="boot" style="margin-top:12px;">
+      <b>目标事务三段证据</b>
+      <table style="margin-top:6px;">
+        <thead><tr><th>环节</th><th>来源物理下标</th><th>内容</th></tr></thead>
+        <tbody id="corr-evidence"></tbody>
+      </table>
+    </div>
+
+    <h2 style="margin-top:16px;">各前缀启动结论（逐前缀按既有恢复语义裁决）</h2>
+    <table>
+      <thead><tr><th>前缀长度</th><th>该前缀物理下标序列</th><th>启动槽</th><th>代次</th>
+        <th>目标完成已写入</th><th>目标页可启动</th><th>首个违约</th><th>裁决依据</th></tr></thead>
+      <tbody id="corr-prefixes"></tbody>
+    </table>
+  </div>
+</section>
 </main>
 <script>
 const MAX = 32;
@@ -275,6 +345,137 @@ async function loadFrozen(){
 
 document.getElementById('submit').addEventListener('click', submit);
 document.getElementById('load').addEventListener('click', loadFrozen);
+
+// ---- replay correction --------------------------------------------------
+const CORR_MAX = 12;
+function corrReadSectors(){
+  const lines = document.getElementById('corr-sectors').value.split('\n')
+    .map(s=>s.trim()).filter(Boolean);
+  const err = document.getElementById('corr-err');
+  if(!lines.length){ err.textContent='请粘贴至少一个来源扇区'; return null; }
+  if(lines.length > CORR_MAX){ err.textContent=`至多 ${CORR_MAX} 个扇区（实际 ${lines.length}）`; return null; }
+  for(const [i,l] of lines.entries()){
+    if(l.length!==88){ err.textContent=`第 ${i+1} 行不是 88 字符定长 Base64（实际 ${l.length}）`; return null; }
+  }
+  err.textContent='';
+  return lines;
+}
+
+function renderCorrection(d){
+  document.getElementById('corr-empty').style.display='none';
+  document.getElementById('corr-result').style.display='block';
+  document.getElementById('corr-headline').textContent =
+    `可重放最小编排：${d.swap_count} 次相邻换位即让事务 ${d.target_transaction} 生效`;
+  document.getElementById('corr-sub').textContent =
+    `来源审计 ${d.source_audit_id} · 目标启动槽 ${d.target.slot} 代次 ${d.target.generation} · 初始活动槽 ${d.active_slot} 不参与越代裁决`;
+  const sv = d.source_verdict || {};
+  const origBoot = sv.boot_slot==null
+    ? '无可启动新代次' : `槽 ${sv.boot_slot} 代次 ${sv.boot_generation}`;
+  const violTxt = sv.first_violation
+    ? `，首个违约 ${esc(sv.first_violation.code)}（扇区 #${sv.first_violation.index}）` : '';
+  document.getElementById('corr-orig').innerHTML =
+    `来源镜像按<b>原始物理顺序</b>裁决：${origBoot}${violTxt}；`
+    + `目标事务原本${sv.target_adopted_originally ? '已被采纳' : `<b>未被采纳</b>`}。`
+    + ` 来源扇区（${d.total_sectors} 个）与该结论已一并冻结。`;
+  document.getElementById('corr-seq').textContent =
+    d.physical_sequence.map(i=>String(i).padStart(2,'0')).join('  →  ');
+  document.getElementById('corr-swaps').textContent = d.swap_count;
+  document.getElementById('corr-n').textContent = d.total_sectors;
+  document.getElementById('corr-hash').textContent = d.source_hash.slice(0,16) + '…';
+  document.getElementById('corr-steps').textContent =
+    d.swap_steps.length ? d.swap_steps.map(s=>`(${s[0]}↔${s[1]})`).join(' ') : '（无需换位，来源顺序已正确）';
+
+  const t = d.target;
+  const rows = [
+    ['准备 prepare', t.prepare_index, `事务 ${t.transaction_id} · 槽 ${t.slot} · 代次 ${t.generation}`],
+    ['目标槽完整页 slot page', t.page_index, `载荷摘要 CRC32 ${t.digest}`],
+    ['完成 complete', t.complete_index, `三段齐备且顺序正确后切换槽 ${t.slot}`],
+  ];
+  document.getElementById('corr-evidence').innerHTML = rows.map(r=>
+    `<tr><td><b>${r[0]}</b></td><td>物理下标 #${r[1]}</td><td>${esc(r[2])}</td></tr>`).join('')
+    + `<tr><td>载荷 HEX（32B）</td><td colspan="2"><code style="word-break:break-all">${esc(t.payload_hex)}</code></td></tr>`;
+
+  const tb = document.getElementById('corr-prefixes');
+  tb.innerHTML = '';
+  d.prefixes.forEach(p=>{
+    const tr = document.createElement('tr');
+    const boot = p.boot_slot==null
+      ? '<span class="muted">无可启动新代次</span>'
+      : `槽 <b>${esc(p.boot_slot)}</b>`;
+    const bootableTag = p.target_bootable
+      ? (p.target_complete_included
+          ? '<span class="tag adopt">是（完成已写入）</span>'
+          : '<span class="tag drop">是（未完成！）</span>')
+      : '<span class="tag tx">否</span>';
+    tr.innerHTML = `<td>${p.length}</td>
+      <td><code>[${p.physical_sequence.join(', ')}]</code></td>
+      <td>${boot}</td><td>${p.boot_generation==null?'-':p.boot_generation}</td>
+      <td>${p.target_complete_included?'是':'否'}</td>
+      <td>${bootableTag}</td>
+      <td>${p.first_violation?esc(p.first_violation):'—'}</td>
+      <td>${esc(p.reason)}</td>`;
+    tb.appendChild(tr);
+  });
+}
+
+async function submitCorrection(){
+  const sectors = corrReadSectors();
+  if(!sectors) return;
+  const txRaw = document.getElementById('corr-tx').value.trim();
+  const tx = Number(txRaw);
+  const err = document.getElementById('corr-err');
+  if(!/^\d+$/.test(txRaw) || !Number.isInteger(tx)){ err.textContent='目标事务标识须为非负整数'; return; }
+  const btn = document.getElementById('corr-submit');
+  btn.disabled = true;
+  try{
+    const resp = await fetch('/api/corrections', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        correction_id: document.getElementById('corr-id').value.trim(),
+        source_audit_id: document.getElementById('corr-src').value.trim(),
+        active_slot: document.getElementById('corr-active').value.trim(),
+        target_transaction: tx, sectors})});
+    const data = await resp.json();
+    if(!resp.ok){ err.textContent = data.message || '提交失败'; return; }
+    err.textContent = resp.status===200 ? '该纠正已冻结，返回既有冻结编排。' : '';
+    renderCorrection(data);
+  }catch(e){ err.textContent='网络错误：'+e; }
+  finally{ btn.disabled=false; }
+}
+
+async function loadCorrection(){
+  const id = document.getElementById('corr-id').value.trim();
+  const err = document.getElementById('corr-err');
+  if(!id){ err.textContent='请输入纠正标识'; return; }
+  const btn = document.getElementById('corr-load');
+  btn.disabled = true;
+  try{
+    const resp = await fetch('/api/corrections/'+encodeURIComponent(id));
+    const data = await resp.json();
+    if(!resp.ok){ err.textContent=data.message; return; }
+    err.textContent='';
+    document.getElementById('corr-src').value = data.source_audit_id;
+    document.getElementById('corr-active').value = data.active_slot;
+    document.getElementById('corr-tx').value = data.target_transaction;
+    if(Array.isArray(data.source_sectors)){
+      document.getElementById('corr-sectors').value = data.source_sectors.join('\n');
+    }
+    renderCorrection(data);
+  }catch(e){ err.textContent='网络错误：'+e; }
+  finally{ btn.disabled=false; }
+}
+
+document.getElementById('corr-submit').addEventListener('click', submitCorrection);
+document.getElementById('corr-load').addEventListener('click', loadCorrection);
+document.getElementById('corr-copy').addEventListener('click', ()=>{
+  document.getElementById('corr-sectors').value =
+    document.getElementById('sectors').value;
+  document.getElementById('corr-src').value =
+    document.getElementById('audit').value.trim();
+  document.getElementById('corr-active').value =
+    document.getElementById('active').value.trim();
+  document.getElementById('corr-err').textContent='已复用上方镜像与参数';
+});
 </script>
 </body>
 </html>

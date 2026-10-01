@@ -9,6 +9,11 @@ Samples:
                              bootable; last valid generation survives
   03_older_invalid_kept.txt  valid gen-3 switch followed by an invalid older
                              write that must not overwrite it
+  04_reorder_target.txt      byte-clean complete transaction whose physical
+                             write order (page, prepare, complete) keeps it
+                             from being adopted; the correction endpoint must
+                             produce the replayable minimum [prepare,page,
+                             complete] with exactly one adjacent swap
 """
 
 from __future__ import annotations
@@ -61,6 +66,18 @@ def main() -> None:
     kept.append(make_page(2, "SLOT_A", P_OTHER, 4))
     kept.append(make_complete(301, 2, "SLOT_A", P_OTHER, 5))
     write("03_older_invalid_kept.txt", kept)
+
+    # 4) every sector is byte-clean, but the target transaction 400 (SLOT_B
+    #    gen2) was physically written page -> prepare -> complete, so the page
+    #    precedes its prepare and the complete then finds no adopted page; the
+    #    target is never adopted. The correction endpoint reorders to
+    #    prepare -> page -> complete with a single adjacent swap.
+    reorder = [
+        make_page(2, "SLOT_B", P2, 0),
+        make_prepare(400, 2, "SLOT_B", P2, 1),
+        make_complete(400, 2, "SLOT_B", P2, 2),
+    ]
+    write("04_reorder_target.txt", reorder)
 
 
 if __name__ == "__main__":

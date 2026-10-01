@@ -139,6 +139,7 @@ class RecoveryResult:
     audit_id: str
     active_slot: str
     total_sectors: int
+    sectors_b64: list[str] = field(default_factory=list)
     first_violation: Optional[dict] = None
     decisions: list[RecordDecision] = field(default_factory=list)
     slots: dict[str, SlotState] = field(default_factory=dict)
@@ -154,6 +155,7 @@ class RecoveryResult:
             "audit_id": self.audit_id,
             "active_slot": self.active_slot,
             "total_sectors": self.total_sectors,
+            "sectors": list(self.sectors_b64),
             "frozen": self.frozen,
             "first_violation": self.first_violation,
             "decisions": [d.__dict__ for d in self.decisions],
@@ -298,7 +300,8 @@ def judge_recovery(
     already-adopted generation.
     """
     result = RecoveryResult(audit_id=audit_id, active_slot=active_slot,
-                            total_sectors=len(sectors_b64), frozen=frozen)
+                            total_sectors=len(sectors_b64),
+                            sectors_b64=list(sectors_b64), frozen=frozen)
 
     prepares: dict[int, Sector] = {}        # transaction id -> prepare sector
     completed_tx: set[int] = set()
