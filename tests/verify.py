@@ -124,6 +124,88 @@ def smoke():
     expect(status == 409 and body.get("error") == "audit_exists",
            "re-submitting a frozen audit id is refused with 409")
 
+    # 6) out-of-order but byte-valid complete transaction: the original audit
+    #    keeps the older boot; the correction service yields the minimum plan
+    out_sectors = read_sample("04_out_of_order_complete.txt")
+    status, body = http("POST", "/api/audits", {
+        "audit_id": "VERIFY-REORDER", "active_slot": "SLOT_A",
+        "sectors": out_sectors})
+    expect(status == 201, "out-of-order image frozen as a normal audit")
+    expect(body["boot"]["slot"] == "SLOT_A"
+           and body["first_violation"]
+           and body["first_violation"]["code"] == "page_before_prepare",
+           "original audit does not adopt the physically-misordered tx 200")
+
+    status, body = http("POST", "/api/corrections", {
+        "correction_id": "VERIFY-FIX-1", "audit_id": "VERIFY-REORDER",
+        "target_transaction_id": 200})
+    expect(status == 201, f"correction accepted (HTTP {status})")
+    sol = body.get("solution", {})
+    expect(sol.get("adjacent_swap_count") == 1,
+           "minimum choreography needs exactly one adjacent swap")
+    expect(sol.get("physical_index_sequence") == [0, 1, 2, 4, 3, 5],
+           "stable canonical physical index sequence")
+    # replayable: the reordered image, judged again, adopts the target cleanly
+    perm = sol["physical_index_sequence"]
+    reordered = [out_sectors[i] for i in perm]
+    status, replay_body = http("POST", "/api/audits", {
+        "audit_id": "VERIFY-REORDER-REPLAY", "active_slot": "SLOT_A",
+        "sectors": reordered})
+    expect(status == 201 and replay_body.get("first_violation") is None
+           and replay_body["boot"]["slot"] == "SLOT_B"
+           and replay_body["boot"]["generation"] == 2,
+           "reordered image replays to the target booting with no violation")
+    # no sector byte changed: same multiset of base64 sectors
+    expect(sorted(reordered) == sorted(out_sectors),
+           "reordering modifies no sector bytes")
+    # every prefix is adjudicated and none reports an unfinished target page
+    prefixes = sol.get("prefixes", [])
+    expect(len(prefixes) == len(out_sectors)
+           and all(p.get("safe") for p in prefixes)
+           and prefixes[-1]["boot_slot"] == "SLOT_B",
+           "every prefix adjudicated; only the final prefix boots the target")
+    ev = sol.get("target_evidence", {})
+    expect(ev.get("adopted") is True and ev.get("slot") == "SLOT_B"
+           and len(ev.get("prepare", [])) == 1
+           and len(ev.get("slot_page", [])) == 1
+           and len(ev.get("complete", [])) == 1,
+           "target prepare/page/complete evidence all present")
+
+    # 7) frozen correction re-opened by its stable correction id
+    status, body = http("GET", "/api/corrections/VERIFY-FIX-1")
+    expect(status == 200
+           and body["solution"]["physical_index_sequence"] ==
+           [0, 1, 2, 4, 3, 5],
+           "frozen correction re-opened by correction id")
+
+    # 8) same correction id with different source data: refused (409)
+    status, body = http("POST", "/api/corrections", {
+        "correction_id": "VERIFY-FIX-1", "audit_id": "VERIFY-REORDER",
+        "target_transaction_id": 100})
+    expect(status == 409 and body.get("error") == "correction_exists"
+           and body["frozen"]["target_transaction_id"] == 200,
+           "re-submitting a frozen correction id is refused with 409")
+
+    # 9) byte-corrupt source (sample 02) is refused for correction; the
+    #    existing recovery audit still reports its original verdict
+    status, body = http("POST", "/api/corrections", {
+        "correction_id": "VERIFY-FIX-2", "audit_id": "VERIFY-CORRUPT",
+        "target_transaction_id": 200})
+    expect(status == 400 and body.get("error") == "bad_sector_crc"
+           and body.get("index") == 5,
+           "correction on a byte-corrupt source is refused at sector #5")
+    status, body = http("GET", "/api/audits/VERIFY-CORRUPT")
+    expect(status == 200 and body["boot"]["slot"] == "SLOT_A"
+           and body["boot"]["generation"] == 1,
+           "original recovery audit still readable with its original verdict")
+
+    # 10) target transaction absent from the frozen image
+    status, body = http("POST", "/api/corrections", {
+        "correction_id": "VERIFY-FIX-3", "audit_id": "VERIFY-CLEAN",
+        "target_transaction_id": 999})
+    expect(status == 404 and body.get("error") == "target_not_in_image",
+           "correction target missing from the image is refused (404)")
+
 
 def main() -> int:
     step("build check (compileall)")

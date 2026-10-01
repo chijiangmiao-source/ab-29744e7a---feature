@@ -1,10 +1,14 @@
-"""HTTP API: submit sector images for audit, and re-open frozen conclusions.
+"""HTTP API: submit sector images for audit, re-open frozen conclusions, and
+request frozen minimum-swap reordering corrections.
 
 Endpoints (JSON in / JSON out, all server logic driven by the real judge):
   GET  /healthz
   GET  /api/audits/<audit_id>
   POST /api/audits
        body: {"audit_id","active_slot","sectors":[base64,...]}
+  GET  /api/corrections/<correction_id>
+  POST /api/corrections
+       body: {"correction_id","audit_id","target_transaction_id":int}
 
 The page is real-API-driven: the HTML is a thin shell and all conclusions,
 decisions and violations come from the API.
@@ -13,10 +17,13 @@ decisions and violations come from the API.
 from __future__ import annotations
 
 import json
+import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional
 from urllib.parse import urlparse
 
+from .correction import CorrectionError, plan_correction
 from .parser import MAX_SECTORS, judge_recovery
 from .storage import AuditExistsError, FrozenStore
 
@@ -71,10 +78,25 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(record, 200)
             return
+        if path.startswith("/api/corrections/"):
+            correction_id = path[len("/api/corrections/"):]
+            if not AUDIT_ID_RE.match(correction_id):
+                self._bad_request("bad_correction_id", "纠正标识格式非法")
+                return
+            record = self.server.correction_store.get(correction_id)  # type: ignore[attr-defined]
+            if record is None:
+                self._send_json({"error": "not_found",
+                                 "message": f"纠正 {correction_id} 不存在或尚未冻结"}, 404)
+                return
+            self._send_json(record, 200)
+            return
         self._send_json({"error": "not_found", "message": "path not found"}, 404)
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/api/corrections":
+            self._handle_correction()
+            return
         if path != "/api/audits":
             self._send_json({"error": "not_found", "message": "path not found"}, 404)
             return
@@ -120,6 +142,90 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         self._send_json(stored, 201)
 
+    def _read_json_body(self) -> tuple[Optional[dict], Optional[tuple]]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None, ("bad_content_length", "Content-Length 非法")
+        if length <= 0 or length > 256 * 1024:
+            return None, ("bad_content_length", "请求体为空或超过 256KiB 限制")
+        raw_body = self.rfile.read(length)
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None, ("bad_json", "请求体不是合法 JSON")
+        if not isinstance(body, dict):
+            return None, ("bad_json", "请求体必须是 JSON 对象")
+        return body, None
+
+    def _handle_correction(self):
+        body, err = self._read_json_body()
+        if err is not None:
+            self._bad_request(err[0], err[1])
+            return
+        correction_id = body.get("correction_id")
+        audit_id = body.get("audit_id")
+        target_tx = body.get("target_transaction_id")
+        if not isinstance(correction_id, str) or not AUDIT_ID_RE.match(
+                correction_id.strip()):
+            self._bad_request("bad_correction_id",
+                              "纠正标识须为 1-64 位字母/数字/_.-且首字符为字母数字")
+            return
+        if not isinstance(audit_id, str) or not AUDIT_ID_RE.match(audit_id.strip()):
+            self._bad_request("bad_audit_id",
+                              "来源审计标识格式非法")
+            return
+        if isinstance(target_tx, bool) or not isinstance(target_tx, int) \
+                or not 0 <= target_tx <= 0xFFFFFFFF:
+            self._bad_request("bad_target_transaction",
+                              "目标事务标识须为 0..2^32-1 的整数")
+            return
+        correction_id = correction_id.strip()
+        audit_id = audit_id.strip()
+
+        # The correction id is write-once: refuse before doing any work if it
+        # is already frozen.
+        if self.server.correction_store.get(correction_id) is not None:  # type: ignore[attr-defined]
+            existing = self.server.correction_store.get(correction_id)  # type: ignore[attr-defined]
+            self._send_json({
+                "error": "correction_exists",
+                "message": (f"纠正标识 {correction_id} 的编排结论已冻结，"
+                            f"不能重新编排；请通过 GET 查看冻结结论"),
+                "frozen": existing,
+            }, 409)
+            return
+
+        source = self.server.store.get(audit_id)  # type: ignore[attr-defined]
+        if source is None:
+            self._send_json({
+                "error": "source_audit_missing",
+                "message": (f"来源审计 {audit_id} 不存在或尚未冻结；"
+                            f"纠正只能基于已冻结的启动槽审计"),
+            }, 404)
+            return
+
+        try:
+            plan = plan_correction(correction_id, source, target_tx)
+        except CorrectionError as e:
+            payload = {"error": e.code, "message": e.message}
+            if e.index is not None:
+                payload["index"] = e.index
+            self._send_json(payload, e.status)
+            return
+
+        try:
+            stored = self.server.correction_store.put_if_absent(  # type: ignore[attr-defined]
+                correction_id, plan)
+        except AuditExistsError:
+            existing = self.server.correction_store.get(correction_id)  # type: ignore[attr-defined]
+            self._send_json({
+                "error": "correction_exists",
+                "message": f"纠正标识 {correction_id} 的编排结论已冻结",
+                "frozen": existing,
+            }, 409)
+            return
+        self._send_json(stored, 201)
+
     def _validate(self, body: dict) -> tuple[bool, tuple | None]:
         audit_id = body.get("audit_id")
         if not isinstance(audit_id, str) or not AUDIT_ID_RE.match(audit_id.strip()):
@@ -140,9 +246,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         return True, None
 
 
-def build_server(host: str, port: int, store: FrozenStore) -> ThreadingHTTPServer:
+def build_server(host: str, port: int, store: FrozenStore,
+                 correction_store: FrozenStore | None = None) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer((host, port), ApiHandler)
     httpd.store = store  # type: ignore[attr-defined]
+    if correction_store is None:
+        correction_store = FrozenStore(
+            os.path.join(os.path.dirname(store.path), "corrections.json"))
+    httpd.correction_store = correction_store  # type: ignore[attr-defined]
     return httpd
 
 

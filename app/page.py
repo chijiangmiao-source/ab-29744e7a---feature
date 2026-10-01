@@ -28,6 +28,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   main { max-width:1180px; margin:0 auto; padding:24px 28px 60px; }
   .grid { display:grid; grid-template-columns:380px 1fr; gap:20px; }
   @media (max-width:960px){ .grid{ grid-template-columns:1fr; } }
+  @media (max-width:760px){ .corr-form-row{ grid-template-columns:1fr !important; } }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
           padding:18px 20px; }
   .card h2 { margin:0 0 12px; font-size:14px; color:#c4d0f5; letter-spacing:.5px; }
@@ -121,6 +122,40 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
   </section>
 </div>
+
+<section class="card" style="margin-top:20px;">
+  <h2>稳定纠正编排（不改动任何扇区字节）</h2>
+  <div class="hint" style="margin-top:0">仅当来源审计已冻结、镜像至多 12 个扇区且全部通过逐字节校验时可用。
+    引擎在全部排列中逐前缀按既有恢复语义裁决，只接受最终启动目标事务、
+    且任一前缀都不把未完成目标页当作可启动的最小相邻换位编排。</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0 16px;"
+       class="corr-form-row">
+    <div>
+      <label for="corr">稳定纠正标识</label>
+      <input id="corr" type="text" placeholder="例如 OBC-FIX-20260930-01"
+             value="OBC-FIX-0001">
+    </div>
+    <div>
+      <label for="corr-audit">来源审计标识（必须已冻结）</label>
+      <input id="corr-audit" type="text" placeholder="例如 OBC-AUDIT-0001"
+             value="OBC-AUDIT-0001">
+    </div>
+    <div>
+      <label for="corr-tx">镜像中已有的目标事务标识（整数）</label>
+      <input id="corr-tx" type="text" placeholder="例如 200" value="">
+    </div>
+  </div>
+  <div style="margin-top:14px;">
+    <button id="corr-submit">提交纠正编排</button>
+    <button id="corr-load" class="ghost">按纠正标识重开冻结结果</button>
+  </div>
+  <div id="corr-err" class="err-inline"></div>
+</section>
+
+<section class="card" id="corr-card" style="display:none;margin-top:20px;">
+  <h2>稳定纠正编排结论 <span class="frozen-badge" style="display:inline-block">已冻结</span></h2>
+  <div id="corr-view"></div>
+</section>
 </main>
 <script>
 const MAX = 32;
@@ -275,6 +310,123 @@ async function loadFrozen(){
 
 document.getElementById('submit').addEventListener('click', submit);
 document.getElementById('load').addEventListener('click', loadFrozen);
+
+// ---------------------------------------------------------------------------
+// Stable correction (minimum adjacent-swap reordering)
+// ---------------------------------------------------------------------------
+
+function renderCorrection(data){
+  document.getElementById('corr-card').style.display = 'block';
+  const s = data.solution, ev = s.target_evidence;
+  const srcBoot = data.source_boot
+    ? `原物理顺序启动 ${esc(data.source_boot.slot)} · 代次 ${data.source_boot.generation}`
+    : '原物理顺序无任何可启动完整事务';
+  const steps = s.swap_steps.map((st,k)=>
+    `<li>第 ${k+1} 步：相邻位置 ${st.swap[0]} ⇄ ${st.swap[1]}
+     换位（移入原下标 #${st.moves_original_index} 的扇区）</li>`).join('');
+  const prefixRows = s.prefixes.map(p=>{
+    const boot = p.boot_slot==null
+      ? '<span class="muted">无可启动槽（保持初始活动槽）</span>'
+      : `槽 <b>${esc(p.boot_slot)}</b> 代次 ${p.boot_generation}`;
+    return `<tr>
+      <td>${p.length}</td>
+      <td><code>[${p.physical_prefix.map(i=>'#'+i).join(', ')}]</code></td>
+      <td>${boot}</td>
+      <td>${p.target_transaction_completed ? '<span class="tag adopt">已采纳</span>'
+        : (p.unfinished_target_page_bootable
+           ? '<span class="tag drop">未完成页被当作可启动</span>'
+           : '<span class="tag tx">未完成（安全）</span>')}</td>
+      <td>${p.safe ? '<span class="tag adopt">安全</span>'
+                   : '<span class="tag drop">不安全</span>'}</td>
+    </tr>`;
+  }).join('');
+  const evRow = (r,label)=> !r || !r.length ? `<tr><td>${label}</td><td colspan="3" class="muted">—</td></tr>`
+    : r.map(x=>`<tr><td>${label}</td><td>最终位 #${x.final_index}（原下标 #${x.original_index}，seq=${x.seq}）</td>
+        <td><span class="tag ${x.adopted?'adopt':'drop'}">${x.adopted?'采纳':'舍弃'}</span></td>
+        <td>${esc(x.basis)}</td></tr>`).join('');
+  document.getElementById('corr-view').innerHTML = `
+    <div class="boot">
+      <span class="name">目标事务 ${data.target_transaction_id} ·
+        槽 ${esc(ev.slot)} · 代次 ${ev.generation}</span>
+      <div class="sub">来源审计 <code>${esc(data.audit_id)}</code>：${srcBoot}；
+        镜像共 ${data.source_sector_count} 个扇区，均未改动任何字节。</div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px;">
+      <div class="boot">
+        <b>规范物理下标序列</b>
+        <div class="sub" style="margin:6px 0;">重排后各槽位放置的<b>原始物理下标</b>：</div>
+        <code style="word-break:break-all">[${s.physical_index_sequence.map(i=>'#'+i).join(', ')}]</code>
+        <div class="sub" style="margin-top:8px;">最少相邻换位次数：<b style="color:var(--good)">${s.adjacent_swap_count}</b></div>
+      </div>
+      <div class="boot">
+        <b>目标事务准备 / 槽页 / 完成证据</b>
+        <div class="sub" style="margin:4px 0;">载荷摘要 CRC32 <code>${esc(ev.digest||'')}</code>
+          · 目标页原下标 ${ev.page_original_indices.map(i=>'#'+i).join(', ')}</div>
+        <table><thead><tr><th>段</th><th>位置</th><th>裁决</th><th>依据</th></tr></thead>
+        <tbody>${evRow(ev.prepare,'准备')}${evRow(ev.slot_page,'槽页')}${evRow(ev.complete,'完成')}</tbody></table>
+      </div>
+    </div>
+    <details style="margin-top:10px;"><summary class="muted" style="cursor:pointer">
+      ${s.adjacent_swap_count} 次相邻换位编排明细</summary>
+      <ol class="sub" style="margin-top:6px;">${steps || '<li>零次换位：原物理顺序已满足全部条件</li>'}</ol></details>
+    <h2 style="margin-top:16px">逐前缀启动结论（全部排列中每放一个扇区即裁决一次）</h2>
+    <table>
+      <thead><tr><th>前缀长度</th><th>原始物理下标前缀</th><th>该前缀启动结论</th>
+        <th>目标事务</th><th>前缀安全</th></tr></thead>
+      <tbody>${prefixRows}</tbody>
+    </table>`;
+}
+
+async function submitCorrection(){
+  const corr = document.getElementById('corr').value.trim();
+  const audit = document.getElementById('corr-audit').value.trim();
+  const txRaw = document.getElementById('corr-tx').value.trim();
+  const errBox = document.getElementById('corr-err');
+  if(!/^[0-9]+$/.test(txRaw)){ errBox.textContent='目标事务标识须为非负整数'; return; }
+  const tx = Number(txRaw);
+  if(tx > 0xFFFFFFFF){ errBox.textContent='目标事务标识超出 32 位范围'; return; }
+  errBox.textContent = '';
+  const btn = document.getElementById('corr-submit');
+  btn.disabled = true;
+  try{
+    const resp = await fetch('/api/corrections', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({correction_id:corr, audit_id:audit,
+                            target_transaction_id:tx})});
+    const data = await resp.json();
+    if(resp.status===409){
+      renderCorrection(data.frozen);
+      errBox.textContent = data.message;
+    } else if(!resp.ok){
+      errBox.textContent = data.message || '提交失败';
+      document.getElementById('corr-card').style.display='none';
+    } else {
+      renderCorrection(data);
+    }
+  } catch(e){
+    errBox.textContent = '网络错误：'+e;
+  } finally { btn.disabled = false; }
+}
+
+async function loadCorrection(){
+  const corr = document.getElementById('corr').value.trim();
+  const errBox = document.getElementById('corr-err');
+  if(!corr){ errBox.textContent='请输入纠正标识'; return; }
+  errBox.textContent='';
+  const btn = document.getElementById('corr-load');
+  btn.disabled = true;
+  try{
+    const resp = await fetch('/api/corrections/'+encodeURIComponent(corr));
+    const data = await resp.json();
+    if(!resp.ok){ errBox.textContent=data.message;
+      document.getElementById('corr-card').style.display='none'; }
+    else { renderCorrection(data); }
+  } catch(e){ errBox.textContent='网络错误：'+e; }
+  finally { btn.disabled = false; }
+}
+
+document.getElementById('corr-submit').addEventListener('click', submitCorrection);
+document.getElementById('corr-load').addEventListener('click', loadCorrection);
 </script>
 </body>
 </html>

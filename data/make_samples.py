@@ -9,6 +9,12 @@ Samples:
                              bootable; last valid generation survives
   03_older_invalid_kept.txt  valid gen-3 switch followed by an invalid older
                              write that must not overwrite it
+  04_out_of_order_complete.txt
+                             all sectors byte-valid and tx 200's prepare/page/
+                             complete are present, but physically written
+                             page -> prepare -> complete, so tx 200 is not
+                             adopted; the stable correction service finds the
+                             1-swap reordering that adopts it
 """
 
 from __future__ import annotations
@@ -61,6 +67,19 @@ def main() -> None:
     kept.append(make_page(2, "SLOT_A", P_OTHER, 4))
     kept.append(make_complete(301, 2, "SLOT_A", P_OTHER, 5))
     write("03_older_invalid_kept.txt", kept)
+
+    # 4) every sector is byte-valid; tx 100 (gen1 SLOT_A) completes, tx 200
+    #    (gen2 SLOT_B) has all three records present but they were physically
+    #    written page -> prepare -> complete, so the recovery semantics reject
+    #    the page (page before its prepare) and tx 200 is never adopted.
+    #    A stable correction reorders it with exactly one adjacent swap.
+    reordered = make_transaction(100, 1, "SLOT_A", P1, 0)
+    reordered += [
+        make_page(2, "SLOT_B", P2, 4),
+        make_prepare(200, 2, "SLOT_B", P2, 3),
+        make_complete(200, 2, "SLOT_B", P2, 5),
+    ]
+    write("04_out_of_order_complete.txt", reordered)
 
 
 if __name__ == "__main__":
